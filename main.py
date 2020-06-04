@@ -6,24 +6,31 @@ from copy import deepcopy
 import json
 
 import torch
-import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from torchvision.datasets import MNIST
-from torchvision.transforms import ToTensor, Compose, Lambda
+from torchvision.transforms import ToTensor, Compose, Lambda, ToPILImage
+from torchvision.utils import make_grid
 import argparse
 from tqdm import tqdm
 
-from models import VanillaVAE, VanillaCNNVAE
+from models import VanillaVAEfc, VanillaVAEcnn
 
 
 def auto_name():
     return datetime.now().strftime("%b%d_%H-%M-%S")
 
 
-def vae_kl(mu, logvar):
-    return -0.5*(1 + logvar - mu.pow(2) - logvar.exp()).sum(dim=1).mean()
+def kl_cost(e, w0, wT, e0, eT):
+    if e <= e0:
+        return w0
+    if e >= eT:
+        return wT
+    wdiff = wT - w0
+    ediff = eT - e0
+    w_per_step = wdiff / ediff
+    return w0 + (e - e0) * w_per_step
 
 
 class Loss:
@@ -46,17 +53,20 @@ def main():
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--exper", default="./results/%s" % autoN, type=str)
-    parser.add_argument("--epoch", default=100, type=int)
-    parser.add_argument("--lr", default=0.001, type=float)
+    parser.add_argument("--epoch", default=500, type=int)
+    parser.add_argument("--lr", default=0.005, type=float)
     parser.add_argument("--bs", default=256, type=int)
     parser.add_argument("--device", default="cuda:0", type=str)
     parser.add_argument("--log_dir", default="./runs", type=str)
     parser.add_argument("--num_workers", default=4, type=int)
     parser.add_argument("--usefc", action="store_true")
     parser.add_argument("--latent_num", default=100, type=int)
+    parser.add_argument("--kl_weight", default=0.001, type=float)
     args = parser.parse_args()
 
     device = torch.device(args.device)
+    kl_w = args.kl_weight
+    topilimage = ToPILImage()
 
     # 读取数据集
     if args.usefc:
@@ -79,17 +89,14 @@ def main():
 
     # 构建模型
     if args.usefc:
-        model = VanillaVAE(
-            28*28, [1000, 500, 500, 200],
-            [200, 500, 500, 1000], args.latent_num
+        model = VanillaVAEfc(
+            28*28, args.latent_num, [1000, 500, 200]
         ).to(device)
     else:
-        model = VanillaCNNVAE(
-            1, [32, 64, 128, 256, 512], args.latent_num, True
-        ).to(device)
-    criterion_rec = nn.BCEWithLogitsLoss()
-    criterion_kl = vae_kl
-    optimizer = optim.Adam(model.parameters(), lr=0.001)
+        model = VanillaVAEcnn(
+            1, args.latent_num, [32, 64, 128, 256, 512]
+        )
+    optimizer = optim.Adam(model.parameters(), lr=args.lr)
 
     # 训练
     writer = SummaryWriter(osp.join(args.log_dir, osp.basename(args.exper)))
@@ -98,19 +105,18 @@ def main():
         "test": {"rec": [], "kl": [], "total": []}
     }
     best = {"index": -1, "model": None, "loss": inf}
-    main_bar = tqdm(total=args.epoch, desc="Epoch: ")
-    for e in range(args.epoch):
-        # minor_bar = tqdm(total=len(train_dataloader)+len(test_dataloader))
+    pilimgs = []
+    for e in tqdm(range(args.epoch), desc="Epoch: "):
+        writer.add_scalar("KL_weight", kl_w, e)
         # train phase
         loss_objs = [Loss() for _ in range(3)]
-        # minor_bar.set_description("Phase: train, Batch: ")
         model.train()
         for img, _ in train_dataloader:
             img = img.to(device)
             rec, mu, logvar = model(img)
-            rec_loss = criterion_rec(rec, img)
-            kl_loss = criterion_kl(mu, logvar)
-            loss = rec_loss + kl_loss
+            loss, rec_loss, kl_loss = model.criterion(
+                rec, img, mu, logvar, kl_w
+            )
             # 更新参数
             optimizer.zero_grad()
             loss.backward()
@@ -119,7 +125,6 @@ def main():
             bs = img.size(0)
             for i, ls in enumerate([rec_loss, kl_loss, loss]):
                 loss_objs[i].add(ls, bs)
-            # minor_bar.update()
         # epoch loss，并更新tensorboard
         epoch_losses = [lo.value() for lo in loss_objs]
         # minor_bar.set_description("Phase: test, Batch: ")
@@ -133,15 +138,14 @@ def main():
         with torch.no_grad():
             for img, _ in test_dataloader:
                 img = img.to(device)
-                rec, mu, logsigma = model(img)
-                rec_loss = criterion_rec(rec, img)
-                kl_loss = criterion_kl(mu, logsigma)
-                loss = rec_loss + kl_loss
+                rec, mu, logvar = model(img)
+                loss, rec_loss, kl_loss = model.criterion(
+                    rec, img, mu, logvar, kl_w
+                )
                 # 记录训练的过程
                 bs = img.size(0)
                 for i, ls in enumerate([rec_loss, kl_loss, loss]):
                     loss_objs[i].add(ls, bs)
-                # minor_bar.update()
         # epoch loss，并更新tensorboard
         epoch_losses = [lo.value() for lo in loss_objs]
         for i, s in enumerate(["rec", "kl", "total"]):
@@ -155,14 +159,13 @@ def main():
             if args.usefc:
                 gen_imgs = gen_imgs.reshape(64, 1, 28, 28)
             writer.add_images("sampling", gen_imgs, e // 5)
+            pilimgs.append(topilimage(make_grid(gen_imgs).cpu()))
 
         # best
         if epoch_losses[-1] < best["loss"]:
             best["index"] = e
             best["loss"] = epoch_losses[-1]
             best["model"] = deepcopy(model.state_dict())
-
-        main_bar.update()
 
     # 保存结果
     print("")
@@ -178,6 +181,12 @@ def main():
         json.dump(best, f)
     with open(osp.join(args.exper, "args.json"), "w") as f:
         json.dump(args.__dict__, f)
+
+    # 采样的图像创建gif
+    pilimgs[0].save(
+        "samples.gif", format="GIF", append_images=pilimgs[1:],
+        save_all=True, duration=500, loop=0
+    )
 
 
 if __name__ == "__main__":

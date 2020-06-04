@@ -1,83 +1,80 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 class VanillaVAE(nn.Module):
-
-    def __init__(self, inpt, enHiddens, outHiddens, LatentNum, useSigma=True):
+    def __init__(self, inpt, latentNum, **kwargs):
         super().__init__()
-        self.useSigma = useSigma
-        self.LatentNum = LatentNum
-        if self.useSigma:
-            bottle_neck_num = LatentNum * 2
-        else:
-            bottle_neck_num = LatentNum
+        self.inpt = inpt
+        self.latentNum = latentNum
+        self.kwargs = kwargs
 
+    def encode(self, x):
+        raise NotImplementedError
+
+    def decode(self, x):
+        raise NotImplementedError
+
+    def forward(self, x):
+        mu, logvar = self.encode(x)
+        dec_inp = self.reparameter(mu, logvar)
+        rec = self.decode(dec_inp)
+        return rec, mu, logvar
+
+    def reparameter(self, mu, logvar):
+        epsilon = torch.randn_like(mu)
+        std = (0.5 * logvar).exp()
+        return mu + std * epsilon
+
+    def criterion(self, rec, ori, mu, logvar, kl_weight):
+        kl_loss = torch.mean(
+            -0.5 * (1 + logvar - mu.pow(2) - logvar.exp()).sum(dim=1))
+        rec_loss = F.mse_loss(rec, ori)
+        total = kl_loss * kl_weight + rec_loss
+
+        return total, rec_loss, kl_loss
+
+
+class VanillaVAEfc(VanillaVAE):
+
+    def __init__(self, inpt, latentNum, hiddens):
+        super().__init__(inpt, latentNum)
+
+        hiddens = list(hiddens)
         encoders = []
-        for i, j in zip([inpt] + enHiddens[:-1], enHiddens):
+        for i, j in zip([inpt] + hiddens[:-1], hiddens):
             encoders.append(nn.Linear(i, j))
             encoders.append(nn.BatchNorm1d(j))
-            encoders.append(nn.ReLU())
-        encoders.append(nn.Linear(enHiddens[-1], bottle_neck_num))
+            encoders.append(nn.LeakyReLU())
+        encoders.append(nn.Linear(hiddens[-1], self.latentNum*2))
         self.encoders = nn.Sequential(*encoders)
 
+        hiddens.reverse()
         decoders = []
-        for i, j in zip([LatentNum] + outHiddens[:-1], outHiddens):
+        for i, j in zip([latentNum] + hiddens[:-1], hiddens):
             decoders.append(nn.Linear(i, j))
             decoders.append(nn.BatchNorm1d(j))
             decoders.append(nn.ReLU())
-        decoders.append(nn.Linear(outHiddens[-1], inpt))
-        # decoders.append(nn.Sigmoid())
+        decoders.append(nn.Linear(hiddens[-1], inpt))
+        decoders.append(nn.Sigmoid())
         self.decoders = nn.Sequential(*decoders)
-
-        self.sigmoid = nn.Sigmoid()
-
-    def forward(self, x):
-        enc_out = self.encoders(x)
-        dec_inp, mu, logvar = self.reparameter(enc_out)
-        rec = self.decoders(dec_inp)
-        return rec, mu, logvar
 
     def encode(self, x):
         enc_out = self.encoders(x)
-        mu = enc_out[:, :self.LatentNum]
-        if self.useSigma:
-            return mu, enc_out[:, self.LatentNum:]
-        return mu, torch.ones_like(mu)
+        mu, logvar = enc_out[:, :self.latentNum], enc_out[:, self.latentNum:]
+        return mu, logvar
 
-    def decode(self, mu, noise=False, logvar=None):
-        if noise:
-            if logvar is None:
-                std = torch.ones_like(mu)
-            else:
-                std = (0.5*logvar).exp()
-            epsilon = torch.randn_like(mu)
-            dec_in = mu + std * epsilon
-        else:
-            dec_in = mu
-        return self.sigmoid(self.decoders(dec_in))
-
-    def reparameter(self, enc_out):
-        epsilon = torch.randn(
-            enc_out.size(0), self.LatentNum).to(enc_out.device)
-        mu = enc_out[:, :self.LatentNum]
-        if self.useSigma:
-            logvar = enc_out[:, self.LatentNum:]
-            std = (0.5 * logvar).exp()
-        else:
-            std = torch.ones_like(mu)
-            logvar = torch.zeros_like(mu)
-
-        return mu + std * epsilon, mu, logvar
+    def decode(self, x):
+        out = self.decoders(x)
+        return out
 
 
-class VanillaCNNVAE(nn.Module):
+class VanillaVAEcnn(VanillaVAE):
+    """ 因为涉及到维度的计算，所以只适用于MNIST """
 
-    def __init__(self, inpt, hiddens, LatentNum, useSigma=True):
-        super().__init__()
-        self.useSigma = useSigma
-        self.LatentNum = LatentNum
-        self.sigmoid = nn.Sigmoid()
+    def __init__(self, inpt, latentNum, hiddens):
+        super().__init__(inpt, latentNum)
 
         encoders = []
         for i, j in zip([inpt] + hiddens[:-1], hiddens):
@@ -93,16 +90,15 @@ class VanillaCNNVAE(nn.Module):
                 #   ==> 7
                 #   ==> 4
                 #   ==> 2
+                #   ==> 1
             )
         self.encoders = nn.Sequential(*encoders)
 
-        self.fc_mu = nn.Linear(hiddens[-1], LatentNum)
-        if useSigma:
-            self.fc_var = nn.Linear(hiddens[-1], LatentNum)
+        self.fc_mu = nn.Linear(hiddens[-1], latentNum)
+        self.fc_var = nn.Linear(hiddens[-1], latentNum)
 
         hiddens.reverse()
-        self.decode_inpt = nn.Linear(LatentNum, hiddens[0])
-
+        self.decode_inpt = nn.Linear(latentNum, hiddens[0])
         decoders = []
         for i, j in zip(hiddens[:-1], hiddens[1:]):
             decoders.append(
@@ -126,31 +122,16 @@ class VanillaCNNVAE(nn.Module):
                 nn.Conv2d(hiddens[-1], 1, kernel_size=5, padding=0)
             )
         )
+        decoders.append(nn.Sigmoid())
         self.decoders = nn.Sequential(*decoders)
 
     def encode(self, x):
         enc_out = self.encoders(x).reshape(x.size(0), -1)
         mu = self.fc_mu(enc_out)
-        if self.useSigma:
-            logvar = self.fc_var(enc_out)
-        else:
-            logvar = torch.zeros_like(mu)
+        logvar = self.fc_var(enc_out)
         return mu, logvar
 
-    def reparameter(self, mu, logvar):
-        epsilon = torch.randn_like(mu)
-        std = (0.5 * logvar).exp()
-        return mu + std * epsilon
-
-    def decode(self, code, sigmoid=True):
+    def decode(self, code):
         code = self.decode_inpt(code).reshape(code.size(0), -1, 1, 1)
         rec = self.decoders(code)
-        if sigmoid:
-            rec = self.sigmoid(rec)
         return rec
-
-    def forward(self, x):
-        mu, logvar = self.encode(x)
-        code = self.reparameter(mu, logvar)
-        rec = self.decode(code, False)
-        return rec, mu, logvar
