@@ -53,7 +53,7 @@ def main():
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--exper", default="./results/%s" % autoN, type=str)
-    parser.add_argument("--epoch", default=500, type=int)
+    parser.add_argument("--epoch", default=200, type=int)
     parser.add_argument("--lr", default=0.005, type=float)
     parser.add_argument("--bs", default=256, type=int)
     parser.add_argument("--device", default="cuda:0", type=str)
@@ -62,6 +62,7 @@ def main():
     parser.add_argument("--usefc", action="store_true")
     parser.add_argument("--latent_num", default=100, type=int)
     parser.add_argument("--kl_weight", default=0.001, type=float)
+    parser.add_argument("--loss_type", default="mse", type=str)
     args = parser.parse_args()
 
     device = torch.device(args.device)
@@ -115,7 +116,7 @@ def main():
             img = img.to(device)
             rec, mu, logvar = model(img)
             loss, rec_loss, kl_loss = model.criterion(
-                rec, img, mu, logvar, kl_w
+                rec, img, mu, logvar, kl_w, args.loss_type
             )
             # 更新参数
             optimizer.zero_grad()
@@ -140,7 +141,7 @@ def main():
                 img = img.to(device)
                 rec, mu, logvar = model(img)
                 loss, rec_loss, kl_loss = model.criterion(
-                    rec, img, mu, logvar, kl_w
+                    rec, img, mu, logvar, kl_w, args.loss_type
                 )
                 # 记录训练的过程
                 bs = img.size(0)
@@ -184,8 +185,8 @@ def main():
 
     # 采样的图像创建gif
     pilimgs[0].save(
-        "samples.gif", format="GIF", append_images=pilimgs[1:],
-        save_all=True, duration=500, loop=0
+        "samples_%s.gif" % args.loss_type, format="GIF",
+        append_images=pilimgs[1:], save_all=True, duration=500, loop=0
     )
 
 

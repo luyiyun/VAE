@@ -27,10 +27,15 @@ class VanillaVAE(nn.Module):
         std = (0.5 * logvar).exp()
         return mu + std * epsilon
 
-    def criterion(self, rec, ori, mu, logvar, kl_weight):
+    def criterion(self, rec, ori, mu, logvar, kl_weight, loss_type="mse"):
         kl_loss = torch.mean(
             -0.5 * (1 + logvar - mu.pow(2) - logvar.exp()).sum(dim=1))
-        rec_loss = F.mse_loss(rec, ori)
+        if loss_type == "mse":
+            rec_loss = F.mse_loss(rec, ori)
+        elif loss_type == "ce":
+            rec_loss = F.binary_cross_entropy(rec, ori)
+        else:
+            raise NotImplementedError
         total = kl_loss * kl_weight + rec_loss
 
         return total, rec_loss, kl_loss
